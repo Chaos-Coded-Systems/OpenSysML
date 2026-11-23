@@ -1,51 +1,242 @@
 name: Runner pilot
-on:
+run-name: Stage2 ${{ inputs.trial }} ${{ inputs.provider }} ${{ inputs.workload }}
+'on':
   workflow_dispatch:
+    inputs:
+      provider:
+        description: Provider
+        type: choice
+        options:
+        - github
+        - blacksmith
+        required: true
+      workload:
+        description: Selected workload
+        type: choice
+        options:
+        - export-library
+        - corpus-sweep
+        required: true
+      trial:
+        description: Predeclared trial
+        type: choice
+        options:
+        - export-1
+        - export-2
+        - corpus-1
+        - corpus-2
+        required: true
 permissions:
   contents: read
 concurrency:
   group: runner-pilot
   cancel-in-progress: false
 jobs:
-  export-library:
-    name: Cold export-library (${{ matrix.provider }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - provider: github
-            runner: ubuntu-24.04
-          - provider: blacksmith
-            runner: blacksmith-4vcpu-ubuntu-2404
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+  benchmark:
+    name: ${{ inputs.trial }} (${{ inputs.provider }})
+    runs-on: ${{ inputs.provider == 'blacksmith' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    env:
+      WORKLOAD: ${{ inputs.workload }}
     steps:
-      - name: Record host
-        run: |
-          mkdir -p source results gomod gobuild
-          uname -srm > results/host.txt
-          lscpu >> results/host.txt
-          free -h >> results/host.txt
-          docker version >> results/host.txt
-          date -u +%FT%TZ > results/job-start.txt
-      - name: Prepare pinned source and container
-        run: |
+    - name: Run frozen bounded benchmark
+      run: |
+        mkdir -p harness
+        cat > harness/container.sh <<'STAGE2_SCRIPT'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        export PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local
+        export HOME=/tmp GOCACHE=/cache/gobuild
+        workload=$1
+        for dir in /work /results /go/pkg/mod /cache/gobuild; do test -w "$dir"; done
+        id > /results/container-user.txt
+        go version > /results/toolchain.txt
+        for f in cpu.max memory.max pids.max cpu.stat memory.events; do
+          cat "/sys/fs/cgroup/$f" > "/results/cgroup-${f//./-}-start.txt"
+        done
+        test "$(cat /sys/fs/cgroup/memory.max)" = 10737418240
+        test "$(cat /sys/fs/cgroup/pids.max)" = 512
+        awk '{if ($1/$2 != 4) exit 1}' /sys/fs/cgroup/cpu.max
+        # A separate tiny program observes the runtime default without changing the source tree.
+        cat > /tmp/gomax.go <<'GO'
+        package main
+        import("fmt";"runtime";"os")
+        func main(){fmt.Printf("NumCPU=%d GOMAXPROCS=%d env_GOMAXPROCS=%q GODEBUG=%q\n",runtime.NumCPU(),runtime.GOMAXPROCS(0),os.Getenv("GOMAXPROCS"),os.Getenv("GODEBUG"))}
+        GO
+        # Use a disposable diagnostic cache so the measured build cache stays cold.
+        GOCACHE=/tmp/diagnostic-cache go run /tmp/gomax.go > /results/gomaxprocs.txt
+        rm -rf /tmp/diagnostic-cache
+        stamp() { printf '%s %s\n' "$(date -u +%FT%T.%NZ)" "$*" >> /results/timing.txt; }
+        runphase() {
+          local name=$1; shift
+          stamp "$name start"
+          local start=$SECONDS rc=0
+          "$@" > "/results/$name.log" 2>&1 || rc=$?
+          stamp "$name end seconds=$((SECONDS-start)) exit=$rc"
+          return "$rc"
+        }
+        runphase modules go mod download
+        if [[ $workload = corpus-sweep ]]; then
+          runphase corpora timeout --signal=TERM --kill-after=10s 420 bash /harness/provision.sh
+          export OPENSYSML_REQUIRE_TRAINING_CORPUS=1 OPENSYSML_REQUIRE_PILOT_CORPORA=1 OPENSYSML_REQUIRE_SPEC_EXAMPLES=1
+          # GOFLAGS preserves the exact queue target, whose recursive make explicitly clears TEST_SHARD_RACE.
+          export GOFLAGS='-count=1 -json'
+          runphase cold timeout --signal=TERM --kill-after=10s 2100 make SHELL=/harness/timed-shell.sh test-queue SHARDS=corpus-sweep
+        else
+          for state in cold warm; do
+            du -sb /cache/gobuild /go/pkg/mod > "/results/cache-$state.txt"
+            # On any unsuccessful cold execution set -e prevents the warm execution.
+            runphase "$state" timeout --signal=TERM --kill-after=10s 1200 make SHELL=/harness/timed-shell.sh test-shard SHARD=export-library TEST_SHARD_RACE='-race -count=1 -json'
+            test "$(grep -c '"Action":"pass".*"Test":' "/results/$state.log")" = 113
+            ! grep -Eq '"Action":"(fail|skip)"|\(cached\)|GATE NOT RUN' "/results/$state.log"
+          done
+        fi
+        if [[ $workload = corpus-sweep ]]; then
+          test "$(grep -c '"Action":"pass".*"Test":' /results/cold.log)" = 1
+          grep -q 'OPENSYSML_CORPUS_SUBSET=construct-cover: 95 of 880 examples' /results/cold.log
+          ! grep -Eq '"Action":"(fail|skip)"|GATE NOT RUN|ratchets not checked' /results/cold.log
+        fi
+        for f in cpu.stat memory.events memory.peak; do
+          cat "/sys/fs/cgroup/$f" > "/results/cgroup-${f//./-}-end.txt"
+        done
+        STAGE2_SCRIPT
+        cat > harness/host.sh <<'STAGE2_SCRIPT'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        mkdir -p source results gomod gobuild harness
+        uname -srm > results/host.txt
+        lscpu >> results/host.txt
+        free -b >> results/host.txt
+        docker version --format '{{.Server.Version}}' >> results/host.txt
+        start=$SECONDS
+        curl --max-time 120 -fsSL https://codeload.github.com/DynamicalSystemsGroup/OpenSysML/tar.gz/4748cc352aeacc5e14cf3ebdbd3ed8dd16c042e0 -o source.tar.gz
+        echo '98c8ed968cee621a66e725751cde204da8804e25329fcae3dc17a27aac1930a9  source.tar.gz' | sha256sum -c - > results/archive.txt
+        tar -xzf source.tar.gz --strip-components=1 -C source
+        find source -type f -print0 | sort -z | xargs -0 sha256sum > results/source-before.sha256
+        docker pull golang@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea > results/image.log
+        printf 'source_image_seconds=%s\n' "$((SECONDS-start))" > results/preparation.txt
+        image=golang@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea
+        # Only the corpus extractor needs poppler; install into a disposable derived image, never the host.
+        if [[ $WORKLOAD = corpus-sweep ]]; then
           start=$SECONDS
-          curl -fsSL https://codeload.github.com/DynamicalSystemsGroup/OpenSysML/tar.gz/4748cc352aeacc5e14cf3ebdbd3ed8dd16c042e0 -o source.tar.gz
-          echo '98c8ed968cee621a66e725751cde204da8804e25329fcae3dc17a27aac1930a9  source.tar.gz' | sha256sum -c -
-          tar -xzf source.tar.gz --strip-components=1 -C source
-          docker pull golang@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea
-          echo "prepare_seconds=$((SECONDS-start))" > results/preparation.txt
-      - name: Run bounded cold shard
-        run: |
-          docker run --rm --name runner-pilot --user "$(id -u):$(id -g)" -e HOME=/tmp -e GOCACHE=/cache/gobuild --cpus=4 --memory=10g --pids-limit=512 --security-opt=no-new-privileges --cap-drop=ALL \
-            -v "$PWD/source:/work" -v "$PWD/results:/results" -v "$PWD/gomod:/go/pkg/mod" -v "$PWD/gobuild:/cache/gobuild" \
-            -w /work golang@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea \
-            bash -lc 'export PATH=/usr/local/go/bin:$PATH; export GOTOOLCHAIN=local; id > /results/container-user.txt; test -w /results && test -w /work && test -w /go/pkg/mod && test -w /cache/gobuild || exit 70; date -u > /results/start.txt; go version > /results/toolchain.txt; start=$SECONDS; go mod download > /results/modules.log 2>&1; rc=$?; echo "modules_seconds=$((SECONDS-start)) exit=$rc" > /results/timing.txt; if [ "$rc" -ne 0 ]; then exit "$rc"; fi; start=$SECONDS; timeout 1200 make test-shard SHARD=export-library > /results/export-library.log 2>&1; rc=$?; echo "shard_seconds=$((SECONDS-start)) exit=$rc" >> /results/timing.txt; date -u > /results/end.txt; cat /results/timing.txt; tail -8 /results/export-library.log; exit "$rc"'
-      - name: Upload pilot results
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: runner-pilot-${{ matrix.provider }}
-          path: results/
-          retention-days: 7
+          docker build --build-arg BASE="$image" -t stage2-corpus - <<'DOCKER' > results/image-provision.log 2>&1
+        ARG BASE
+        FROM ${BASE}
+        RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils python3 && rm -rf /var/lib/apt/lists/*
+        DOCKER
+          image=stage2-corpus
+          printf 'image_provision_seconds=%s\n' "$((SECONDS-start))" >> results/preparation.txt
+        fi
+        # Minimal parsing uses host Python; the benchmark image has no added export dependencies.
+        docker create --name stage2 --user "$(id -u):$(id -g)" --cpus=4 --memory=10g --pids-limit=512 --security-opt=no-new-privileges --cap-drop=ALL \
+          -e HOME=/tmp -e GOCACHE=/cache/gobuild -e WORKLOAD \
+          -v "$PWD/source:/work" -v "$PWD/results:/results" -v "$PWD/gomod:/go/pkg/mod" -v "$PWD/gobuild:/cache/gobuild" -v "$PWD/harness:/harness:ro" \
+          -w /work "$image" bash /harness/container.sh "$WORKLOAD" > /dev/null
+        docker inspect stage2 --format '{{json .HostConfig}}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({k:d[k] for k in ["NanoCpus","Memory","PidsLimit","CapDrop","SecurityOpt"]}))' > results/limits.json
+        sampler() {
+          while :; do
+            date -u +%FT%T.%NZ
+            docker stats --no-stream --format '{{json .}}' stage2 | python3 -c 'import json,sys; s=sys.stdin.read().strip(); d=json.loads(s) if s else {}; print(json.dumps({k:d.get(k) for k in ["CPUPerc","MemUsage","MemPerc","PIDs"]}))'
+            sleep 10
+          done
+        }
+        sampler > results/resources.jsonl 2>&1 &
+        sampler_pid=$!
+        trap 'kill "$sampler_pid" 2>/dev/null || true' EXIT
+        rc=0
+        docker start -a stage2 > results/container.log 2>&1 || rc=$?
+        kill "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" 2>/dev/null || true
+        docker inspect stage2 --format '{{json .State}}' > results/container-state.json
+        if [[ "$rc" = 0 ]]; then
+          python3 harness/check_events.py results/cold.log "$WORKLOAD" > results/cold-validation.json || rc=$?
+          if [[ $WORKLOAD = export-library && "$rc" = 0 ]]; then
+            python3 harness/check_events.py results/warm.log "$WORKLOAD" > results/warm-validation.json || rc=$?
+          fi
+        fi
+        find source -type f -not -path 'source/build/*' -not -path 'source/examples/pilot-corpora/*' -not -path 'source/examples/sysml-v2-training/*' -not -path 'source/examples/spec-examples/*' -print0 | sort -z | xargs -0 sha256sum > results/source-after.sha256
+        sha256sum harness/* > results/harness.sha256
+        printf 'container_exit=%s\n' "$rc" >> results/preparation.txt
+        exit "$rc"
+        STAGE2_SCRIPT
+        cat > harness/provision.sh <<'STAGE2_SCRIPT'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        ./scripts/download-training-examples.sh
+        ./scripts/download-pilot-corpora.sh
+        ./scripts/download-spec-examples.sh
+        python3 - <<'PY'
+        import hashlib, json
+        from pathlib import Path
+        roots = ['sysml-v2-training', 'pilot-corpora/kerml-examples', 'pilot-corpora/sysml-examples', 'pilot-corpora/sysml-validation', 'spec-examples/kerml', 'spec-examples/sysml']
+        result = {}
+        for root in roots:
+            base = Path('examples') / root
+            files = sorted(p for p in base.rglob('*') if p.suffix in ('.sysml', '.kerml'))
+            assert files, root
+            result[root] = {'count': len(files), 'pin': (base / '.pilot-pin').read_text().strip() if (base / '.pilot-pin').exists() else None}
+        models = sorted(p for p in Path('examples').rglob('*') if p.suffix in ('.sysml', '.kerml'))
+        assert len(models) == 880, len(models)
+        cover = [s for s in Path('tests/corpus/testdata/construct_cover.txt').read_text().splitlines() if s and not s.startswith('#')]
+        assert len(cover) == 95
+        assert all((Path('examples') / s).is_file() for s in cover)
+        manifest = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in models}
+        Path('/results/input-models.json').write_text(json.dumps(manifest, indent=2))
+        Path('/results/input-roots.json').write_text(json.dumps(result, indent=2))
+        PY
+        STAGE2_SCRIPT
+        cat > harness/timed-shell.sh <<'STAGE2_SCRIPT'
+        #!/usr/bin/env bash
+        set -uo pipefail
+        start=$SECONDS
+        rc=0
+        /bin/sh "$@" || rc=$?
+        case "$*" in
+          *'go generate'*) printf '%s snapshot_command_seconds=%s exit=%s\n' "$(date -u +%FT%T.%NZ)" "$((SECONDS-start))" "$rc" >> /results/snapshot-timing.txt ;;
+        esac
+        exit "$rc"
+        STAGE2_SCRIPT
+        cat > harness/check_events.py <<'STAGE2_SCRIPT'
+        #!/usr/bin/env python3
+        """Fail closed on incomplete, cached, skipped or mismatched selected Go execution."""
+        import json, sys
+        from pathlib import Path
+
+        def parse(path, workload):
+            raw = Path(path).read_text()
+            events = []
+            for line in raw.splitlines():
+                if line.startswith('{'):
+                    event = json.loads(line)
+                    if 'Action' in event:
+                        events.append(event)
+            parent = 'TestLibraryFilesComeBackFromTheGraphAlone' if workload == 'export-library' else 'TestExamplesSweep'
+            starts = [e for e in events if e['Action'] == 'run' and e.get('Test')]
+            outcomes = [e for e in events if e['Action'] in ('pass', 'fail', 'skip') and e.get('Test')]
+            packages = [e for e in events if e['Action'] in ('pass', 'fail', 'skip') and not e.get('Test')]
+            names = [e['Test'] for e in outcomes]
+            assert starts and packages and outcomes, 'missing complete execution evidence'
+            assert all(e['Action'] == 'pass' for e in outcomes + packages), 'failed/skipped outcome'
+            assert len(names) == len(set(names)), 'duplicate outcome'
+            assert sorted(names) == sorted(e['Test'] for e in starts), 'unterminated test'
+            assert parent in names and all(n == parent or n.startswith(parent + '/') for n in names), 'wrong selection'
+            assert len(names) == (113 if workload == 'export-library' else 1), 'unexpected selected test count'
+            assert '(cached)' not in raw and 'GATE NOT RUN' not in raw and 'ratchets not checked' not in raw, 'cached or incomplete ratchet'
+            if workload == 'corpus-sweep':
+                assert 'OPENSYSML_CORPUS_SUBSET=construct-cover: 95 of 880 examples' in raw, 'subset/input drift'
+            return {'outcomes': len(names), 'names': sorted(names), 'packages': packages,
+                    'first_package_event': next(e['Time'] for e in events if e['Action'] == 'start'),
+                    'first_test_event': starts[0]['Time'], 'last_outcome': outcomes[-1]['Time']}
+
+        if __name__ == '__main__':
+            print(json.dumps(parse(*sys.argv[1:]), indent=2))
+        STAGE2_SCRIPT
+        chmod +x harness/*.sh
+        timeout --signal=TERM --kill-after=15s 2620 bash harness/host.sh
+    - name: Upload complete benchmark evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: stage2-${{ inputs.trial }}-${{ inputs.provider }}
+        path: results/
+        retention-days: 30
