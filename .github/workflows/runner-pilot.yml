@@ -38,10 +38,10 @@ jobs:
           echo "prepare_seconds=$((SECONDS-start))" > results/preparation.txt
       - name: Run bounded cold shard
         run: |
-          docker run --rm --name runner-pilot --cpus=4 --memory=10g --pids-limit=512 --security-opt=no-new-privileges --cap-drop=ALL \
-            -v "$PWD/source:/work" -v "$PWD/results:/results" -v "$PWD/gomod:/go/pkg/mod" -v "$PWD/gobuild:/root/.cache/go-build" \
+          docker run --rm --name runner-pilot --user "$(id -u):$(id -g)" -e HOME=/tmp -e GOCACHE=/cache/gobuild --cpus=4 --memory=10g --pids-limit=512 --security-opt=no-new-privileges --cap-drop=ALL \
+            -v "$PWD/source:/work" -v "$PWD/results:/results" -v "$PWD/gomod:/go/pkg/mod" -v "$PWD/gobuild:/cache/gobuild" \
             -w /work golang@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea \
-            bash -lc 'export PATH=/usr/local/go/bin:$PATH; export GOTOOLCHAIN=local; date -u > /results/start.txt; go version > /results/toolchain.txt; start=$SECONDS; go mod download > /results/modules.log 2>&1; rc=$?; echo "modules_seconds=$((SECONDS-start)) exit=$rc" > /results/timing.txt; if [ "$rc" -ne 0 ]; then exit "$rc"; fi; start=$SECONDS; timeout 1200 make test-shard SHARD=export-library > /results/export-library.log 2>&1; rc=$?; echo "shard_seconds=$((SECONDS-start)) exit=$rc" >> /results/timing.txt; date -u > /results/end.txt; cat /results/timing.txt; tail -8 /results/export-library.log; exit "$rc"'
+            bash -lc 'export PATH=/usr/local/go/bin:$PATH; export GOTOOLCHAIN=local; id > /results/container-user.txt; test -w /results && test -w /work && test -w /go/pkg/mod && test -w /cache/gobuild || exit 70; date -u > /results/start.txt; go version > /results/toolchain.txt; start=$SECONDS; go mod download > /results/modules.log 2>&1; rc=$?; echo "modules_seconds=$((SECONDS-start)) exit=$rc" > /results/timing.txt; if [ "$rc" -ne 0 ]; then exit "$rc"; fi; start=$SECONDS; timeout 1200 make test-shard SHARD=export-library > /results/export-library.log 2>&1; rc=$?; echo "shard_seconds=$((SECONDS-start)) exit=$rc" >> /results/timing.txt; date -u > /results/end.txt; cat /results/timing.txt; tail -8 /results/export-library.log; exit "$rc"'
       - name: Upload pilot results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
