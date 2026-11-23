@@ -49,8 +49,19 @@ jobs:
         export HOME=/tmp GOCACHE=/cache/gobuild
         workload=$1
         for dir in /work /results /go/pkg/mod /cache/gobuild; do test -w "$dir"; done
+        finish() {
+          local rc=$?
+          trap - EXIT
+          for f in cpu.stat memory.events memory.peak; do
+            cat "/sys/fs/cgroup/$f" > "/results/cgroup-${f//./-}-end.txt" 2>/dev/null || true
+          done
+          printf '%s container_exit=%s\n' "$(date -u +%FT%T.%NZ)" "$rc" >> /results/container-end.txt
+          exit "$rc"
+        }
+        trap finish EXIT
         id > /results/container-user.txt
         go version > /results/toolchain.txt
+        sha256sum /usr/local/go/bin/go /usr/bin/make /bin/bash > /results/tools.sha256
         for f in cpu.max memory.max pids.max cpu.stat memory.events; do
           cat "/sys/fs/cgroup/$f" > "/results/cgroup-${f//./-}-start.txt"
         done
@@ -77,6 +88,10 @@ jobs:
         }
         runphase modules go mod download
         if [[ $workload = corpus-sweep ]]; then
+          dpkg-query -W > /results/packages.txt
+          pdftotext -v > /results/poppler.txt 2>&1
+          python3 --version > /results/python.txt
+          sha256sum "$(command -v python3)" "$(command -v pdftotext)" >> /results/tools.sha256
           runphase corpora timeout --signal=TERM --kill-after=10s 420 bash /harness/provision.sh
           export OPENSYSML_REQUIRE_TRAINING_CORPUS=1 OPENSYSML_REQUIRE_PILOT_CORPORA=1 OPENSYSML_REQUIRE_SPEC_EXAMPLES=1
           # GOFLAGS preserves the exact queue target, whose recursive make explicitly clears TEST_SHARD_RACE.
@@ -93,12 +108,9 @@ jobs:
         fi
         if [[ $workload = corpus-sweep ]]; then
           test "$(grep -c '"Action":"pass".*"Test":' /results/cold.log)" = 1
-          grep -q 'OPENSYSML_CORPUS_SUBSET=construct-cover: 95 of 880 examples' /results/cold.log
+          grep -q 'OPENSYSML_CORPUS_SUBSET=construct-cover: 95 of 893 examples' /results/cold.log
           ! grep -Eq '"Action":"(fail|skip)"|GATE NOT RUN|ratchets not checked' /results/cold.log
         fi
-        for f in cpu.stat memory.events memory.peak; do
-          cat "/sys/fs/cgroup/$f" > "/results/cgroup-${f//./-}-end.txt"
-        done
         STAGE2_SCRIPT
         cat > harness/host.sh <<'STAGE2_SCRIPT'
         #!/usr/bin/env bash
@@ -122,7 +134,9 @@ jobs:
           docker build --build-arg BASE="$image" -t stage2-corpus - <<'DOCKER' > results/image-provision.log 2>&1
         ARG BASE
         FROM ${BASE}
-        RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils python3 && rm -rf /var/lib/apt/lists/*
+        RUN . /etc/os-release && rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* && \
+            printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20261122T000000Z/ %s main\ndeb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20261122T000000Z/ %s-security main\n' "$VERSION_CODENAME" "$VERSION_CODENAME" > /etc/apt/sources.list && \
+            apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends poppler-utils python3 && rm -rf /var/lib/apt/lists/*
         DOCKER
           image=stage2-corpus
           printf 'image_provision_seconds=%s\n' "$((SECONDS-start))" >> results/preparation.txt
@@ -176,7 +190,9 @@ jobs:
             assert files, root
             result[root] = {'count': len(files), 'pin': (base / '.pilot-pin').read_text().strip() if (base / '.pilot-pin').exists() else None}
         models = sorted(p for p in Path('examples').rglob('*') if p.suffix in ('.sysml', '.kerml'))
-        assert len(models) == 880, len(models)
+        expected = {s.split('\t',1)[1] for s in Path('tests/corpus/testdata/corpus_roundtrip_expected.txt').read_text().splitlines() if s and not s.startswith('#')}
+        assert {str(f.relative_to('examples')) for f in models} == expected, 'model set differs from frozen ratchet'
+        assert len(models) == 893, len(models)
         cover = [s for s in Path('tests/corpus/testdata/construct_cover.txt').read_text().splitlines() if s and not s.startswith('#')]
         assert len(cover) == 95
         assert all((Path('examples') / s).is_file() for s in cover)
@@ -223,8 +239,9 @@ jobs:
             assert len(names) == (113 if workload == 'export-library' else 1), 'unexpected selected test count'
             assert '(cached)' not in raw and 'GATE NOT RUN' not in raw and 'ratchets not checked' not in raw, 'cached or incomplete ratchet'
             if workload == 'corpus-sweep':
-                assert 'OPENSYSML_CORPUS_SUBSET=construct-cover: 95 of 880 examples' in raw, 'subset/input drift'
+                assert 'OPENSYSML_CORPUS_SUBSET=construct-cover: 95 of 893 examples' in raw, 'subset/input drift'
             return {'outcomes': len(names), 'names': sorted(names), 'packages': packages,
+                    'corpus_summaries': [e['Output'].strip() for e in events if workload == 'corpus-sweep' and e.get('Output') and any(x in e['Output'] for x in ['corpus round trip:', 'models checked', 'examples convert;', 'classes of disagreement', 'OPENSYSML_CORPUS_SUBSET=construct-cover:'])],
                     'first_package_event': next(e['Time'] for e in events if e['Action'] == 'start'),
                     'first_test_event': starts[0]['Time'], 'last_outcome': outcomes[-1]['Time']}
 
